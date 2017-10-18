@@ -65,8 +65,8 @@ static inline void vmentry(void)
 /* implemented by ring */
 void alloc_ring(void);
 /* guest side */
-int add_inbuf(unsigned, void *, void *);
-void *get_buf(unsigned *, void **);
+int add_inbuf(unsigned, void *, void *, unsigned short);
+void *get_buf(unsigned *, void **, unsigned short *);
 void disable_call();
 bool used_empty();
 bool enable_call();
@@ -75,7 +75,7 @@ void kick_available();
 void disable_kick();
 bool avail_empty();
 bool enable_kick();
-bool use_buf(unsigned *, void **);
+bool use_buf(unsigned *, void **, unsigned short *);
 void call_used();
 
 /* implemented by main */

@@ -12,6 +12,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#define DEBUG 0
+#define DPRINT(fmt, ...) \
+	do { if (DEBUG) printf(fmt, __VA_ARGS__); } while (0)
+
+
 /* Next - Where next entry will be written.
  * Prev - "Next" value when event triggered previously.
  * Event - Peer requested event after writing this entry.
@@ -28,13 +33,14 @@ static inline bool need_event(unsigned short event,
  * Host overwrites used descriptors with correct len, index, and DESC_HW clear.
  * Flags are always set last.
  */
-#define DESC_HW 0x1
+#define DESC_HW   0x80
+#define DESC_WRAP 0x40
 
 struct desc {
-	unsigned short flags;
-	unsigned short index;
-	unsigned len;
 	unsigned long long addr;
+	unsigned len;
+	unsigned short index;
+	unsigned short flags;
 };
 
 /* how much padding is needed to avoid false cache sharing */
@@ -57,6 +63,7 @@ struct desc *ring;
 struct event *event;
 
 struct guest {
+	unsigned short wrap;
 	unsigned avail_idx;
 	unsigned last_used_idx;
 	unsigned num_free;
@@ -68,6 +75,7 @@ struct host {
 	/* we do not need to track last avail index
 	 * unless we have more than one in flight.
 	 */
+	unsigned short wrap;
 	unsigned used_idx;
 	unsigned called_used_idx;
 	unsigned char reserved[HOST_GUEST_PADDING - 4];
@@ -93,8 +101,10 @@ void alloc_ring(void)
 	guest.avail_idx = 0;
 	guest.kicked_avail_idx = -1;
 	guest.last_used_idx = 0;
+	guest.wrap = 0x40;
 	host.used_idx = 0;
 	host.called_used_idx = -1;
+	host.wrap = 0x40;
 	for (i = 0; i < ring_size; ++i) {
 		struct desc desc = {
 			.index = i,
@@ -110,16 +120,29 @@ void alloc_ring(void)
 	memset(data, 0, ring_size * sizeof *data);
 }
 
+
 /* guest side */
-int add_inbuf(unsigned len, void *buf, void *datap)
+int add_inbuf(unsigned len, void *buf, void *datap, unsigned short flags)
 {
 	unsigned head, index;
 
-	if (!guest.num_free)
+	if (!guest.num_free) {
+		DPRINT("add_inbuf: ring full, guest.last_used=%d, guest.avail_idx=%d\n", guest.last_used_idx,
+				guest.avail_idx);
 		return -1;
+	}
 
 	guest.num_free--;
 	head = (ring_size - 1) & (guest.avail_idx++);
+	if (head == 0) {
+		if (guest.wrap == 0x40)
+			guest.wrap = 0;
+		else if (guest.wrap == 0)
+			guest.wrap = 0x40;
+	}
+
+	DPRINT("wrap is %d\n", guest.wrap);
+	DPRINT("add_inbuf: add to buf head = %d, guest_avail_idx now %d\n", head, guest.avail_idx);
 
 	/* Start with a write. On MESI architectures this helps
 	 * avoid a shared state with consumer that is polling this descriptor.
@@ -137,19 +160,22 @@ int add_inbuf(unsigned len, void *buf, void *datap)
 	data[index].data = datap;
 	/* Barrier A (for pairing) */
 	smp_release();
-	ring[head].flags = DESC_HW;
-
+	ring[head].flags = DESC_HW | guest.wrap;
+	DPRINT("ADD_inbuf: write flags %x, head idx = %d\n", ring[head].flags, head);
 	return 0;
 }
 
-void *get_buf(unsigned *lenp, void **bufp)
+void *get_buf(unsigned *lenp, void **bufp, unsigned short *flags)
 {
 	unsigned head = (ring_size - 1) & guest.last_used_idx;
 	unsigned index;
 	void *datap;
 
-	if (ring[head].flags & DESC_HW)
+	if (ring[head].flags & DESC_HW) {
+		DPRINT("get_buf: belongs to device head idx %d\n", head);
 		return NULL;
+	}
+	DPRINT("get_buf: guest.last_used_idx = %d\n", guest.last_used_idx);
 	/* Barrier B (for pairing) */
 	smp_acquire();
 	*lenp = ring[head].len;
@@ -160,6 +186,7 @@ void *get_buf(unsigned *lenp, void **bufp)
 	data[index].data = NULL;
 	guest.num_free++;
 	guest.last_used_idx++;
+	*flags = ring[head].flags;
 	return datap;
 }
 
@@ -167,7 +194,7 @@ bool used_empty()
 {
 	unsigned head = (ring_size - 1) & guest.last_used_idx;
 
-	return (ring[head].flags & DESC_HW);
+	return (ring[head].flags & DESC_HW) && ((ring[head].flags & DESC_WRAP) == host.wrap);
 }
 
 void disable_call()
@@ -223,13 +250,24 @@ bool avail_empty()
 	return !(ring[head].flags & DESC_HW);
 }
 
-bool use_buf(unsigned *lenp, void **bufp)
+bool use_buf(unsigned *lenp, void **bufp, unsigned short *flags)
 {
 	unsigned head = (ring_size - 1) & host.used_idx;
 
-	if (!(ring[head].flags & DESC_HW))
+	/* Yes this can be done shorter, but I like clarity */
+	if (head == 0) {
+		if (host.wrap == DESC_WRAP)
+			host.wrap = 0;
+		else if (host.wrap == 0)
+			host.wrap = DESC_WRAP;
+	}
+	if (!(ring[head].flags & DESC_HW)) 
 		return false;
 
+	if ((ring[head].flags & DESC_WRAP) != host.wrap ) 
+		return false;
+
+	DPRINT("use_buf: head idx=%d\n", head);
 	/* make sure length read below is not speculated */
 	/* Barrier A (for pairing) */
 	smp_acquire();
@@ -245,8 +283,12 @@ bool use_buf(unsigned *lenp, void **bufp)
 	 * so I have no way to test whether it's a gain.
 	 */
 	/* Barrier B (for pairing) */
+	*flags = ring[head].flags;
 	smp_release();
-	ring[head].flags = 0;
+	if (host.wrap )
+		ring[head].flags = DESC_WRAP;
+	else
+		ring[head].flags = 0;
 	host.used_idx++;
 	return true;
 }

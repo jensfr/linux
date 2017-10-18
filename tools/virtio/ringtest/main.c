@@ -17,6 +17,13 @@
 #include <unistd.h>
 #include <limits.h>
 
+#define DEBUG 0
+#define DPRINT(fmt, ...) \
+	do { if (DEBUG) printf(fmt, __VA_ARGS__); } while (0)
+
+#define DESC_HW   0x80
+#define DESC_WRAP 0x40
+
 int runcycles = 10000000;
 int max_outstanding = INT_MAX;
 int batch = 1;
@@ -114,6 +121,8 @@ static void __attribute__((__flatten__)) run_guest(void)
 	unsigned len;
 	void *buf;
 	int tokick = batch;
+	unsigned short flags;
+	unsigned short getflags;
 
 	for (;;) {
 		if (do_sleep)
@@ -122,7 +131,7 @@ static void __attribute__((__flatten__)) run_guest(void)
 		do {
 			if (started < bufs &&
 			    started - completed < max_outstanding) {
-				r = add_inbuf(0, "Buffer\n", "Hello, world!");
+				r = add_inbuf(0, "Buffer\n", "Hello, world!", flags);
 				if (__builtin_expect(r == 0, true)) {
 					++started;
 					if (!--tokick) {
@@ -130,13 +139,17 @@ static void __attribute__((__flatten__)) run_guest(void)
 						if (do_sleep)
 							kick_available();
 					}
-
+					flags &= ~DESC_WRAP;
+				} else {
+					flags |= DESC_WRAP;
 				}
-			} else
+			} else {
 				r = -1;
+			}
 
 			/* Flush out completed bufs if any */
-			if (get_buf(&len, &buf)) {
+			//if (get_buf(&len, &buf, &flags)) {
+			if (get_buf(&len, &buf, &getflags)) {
 				++completed;
 				if (__builtin_expect(completed == bufs, false))
 					return;
@@ -170,6 +183,7 @@ static void __attribute__((__flatten__)) run_host(void)
 	int bufs = runcycles;
 	unsigned len;
 	void *buf;
+	unsigned short flags;
 
 	for (;;) {
 		if (do_sleep) {
@@ -181,7 +195,9 @@ static void __attribute__((__flatten__)) run_host(void)
 		if (do_sleep)
 			disable_kick();
 		completed_before = completed;
-		while (__builtin_expect(use_buf(&len, &buf), true)) {
+		while (__builtin_expect(use_buf(&len, &buf, &flags), true)) {
+			if (flags & DESC_WRAP)
+				DPRINT("use_buf: skip bit in desc, %d\n", completed);
 			if (do_sleep)
 				call_used();
 			++completed;
