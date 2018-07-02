@@ -1426,10 +1426,12 @@ long vhost_vring_ioctl(struct vhost_dev *d, unsigned int ioctl, void __user *arg
 		vq->last_avail_idx = s.num;
 		/* Forget the cached index value. */
 		vq->avail_idx = vq->last_avail_idx;
+#if 0
 		if (vhost_has_feature(vq, VIRTIO_F_RING_PACKED)) {
 			vq->last_avail_wrap_counter = wrap_counter;
 			vq->avail_wrap_counter = vq->last_avail_wrap_counter;
 		}
+#endif
 		break;
 	case VHOST_GET_VRING_BASE:
 		s.index = idx;
@@ -1460,8 +1462,10 @@ long vhost_vring_ioctl(struct vhost_dev *d, unsigned int ioctl, void __user *arg
 			break;
 		}
 		vq->last_used_idx = s.num;
+#if 0
 		if (vhost_has_feature(vq, VIRTIO_F_RING_PACKED))
 			vq->last_used_wrap_counter = wrap_counter;
+#endif
 		break;
 	case VHOST_GET_VRING_USED_BASE:
 		s.index = idx;
