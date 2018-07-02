@@ -98,11 +98,12 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 
 	for (;;) {
 		struct virtio_vsock_pkt *pkt;
+		struct vring_used_elem used;
 		struct iov_iter iov_iter;
 		unsigned out, in;
 		size_t nbytes;
 		size_t len;
-		int head;
+		int ret;
 
 		spin_lock_bh(&vsock->send_pkt_list_lock);
 		if (list_empty(&vsock->send_pkt_list)) {
@@ -116,16 +117,9 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 		list_del_init(&pkt->list);
 		spin_unlock_bh(&vsock->send_pkt_list_lock);
 
-		head = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
-					 &out, &in, NULL, NULL);
-		if (head < 0) {
-			spin_lock_bh(&vsock->send_pkt_list_lock);
-			list_add(&pkt->list, &vsock->send_pkt_list);
-			spin_unlock_bh(&vsock->send_pkt_list_lock);
-			break;
-		}
-
-		if (head == vq->num) {
+		ret = vhost_get_vq_desc(vq, &used, vq->iov, ARRAY_SIZE(vq->iov),
+					&out, &in, NULL, NULL);
+		if (ret == -ENOSPC) {
 			spin_lock_bh(&vsock->send_pkt_list_lock);
 			list_add(&pkt->list, &vsock->send_pkt_list);
 			spin_unlock_bh(&vsock->send_pkt_list_lock);
@@ -139,6 +133,12 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 			}
 			break;
 		}
+		if (ret < 0) {
+			spin_lock_bh(&vsock->send_pkt_list_lock);
+			list_add(&pkt->list, &vsock->send_pkt_list);
+			spin_unlock_bh(&vsock->send_pkt_list_lock);
+			break;
+		}
 
 		if (out) {
 			virtio_transport_free_pkt(pkt);
@@ -146,7 +146,7 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 			break;
 		}
 
-		len = iov_length(&vq->iov[out], in);
+		len = vhost32_to_cpu(vq, used.len);
 		iov_iter_init(&iov_iter, READ, &vq->iov[out], in, len);
 
 		nbytes = copy_to_iter(&pkt->hdr, sizeof(pkt->hdr), &iov_iter);
@@ -163,7 +163,7 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 			break;
 		}
 
-		vhost_add_used(vq, head, sizeof(pkt->hdr) + pkt->len);
+		vhost_add_used(vq, &used, sizeof(pkt->hdr) + pkt->len);
 		added = true;
 
 		if (pkt->reply) {
@@ -346,7 +346,8 @@ static void vhost_vsock_handle_tx_kick(struct vhost_work *work)
 	struct vhost_vsock *vsock = container_of(vq->dev, struct vhost_vsock,
 						 dev);
 	struct virtio_vsock_pkt *pkt;
-	int head;
+	struct vring_used_elem used;
+	int ret;
 	unsigned int out, in;
 	bool added = false;
 
@@ -367,18 +368,17 @@ static void vhost_vsock_handle_tx_kick(struct vhost_work *work)
 			goto no_more_replies;
 		}
 
-		head = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
-					 &out, &in, NULL, NULL);
-		if (head < 0)
-			break;
-
-		if (head == vq->num) {
+		ret = vhost_get_vq_desc(vq, &used, vq->iov, ARRAY_SIZE(vq->iov),
+					&out, &in, NULL, NULL);
+		if (ret == -ENOSPC) {
 			if (unlikely(vhost_enable_notify(&vsock->dev, vq))) {
 				vhost_disable_notify(&vsock->dev, vq);
 				continue;
 			}
 			break;
 		}
+		if (ret < 0)
+			break;
 
 		pkt = vhost_vsock_alloc_pkt(vq, out, in);
 		if (!pkt) {
@@ -397,7 +397,7 @@ static void vhost_vsock_handle_tx_kick(struct vhost_work *work)
 		else
 			virtio_transport_free_pkt(pkt);
 
-		vhost_add_used(vq, head, sizeof(pkt->hdr) + len);
+		vhost_add_used(vq, &used, sizeof(pkt->hdr) + len);
 		added = true;
 	}
 

@@ -67,7 +67,7 @@ struct vhost_scsi_inflight {
 
 struct vhost_scsi_cmd {
 	/* Descriptor from vhost_get_vq_desc() for virt_queue segment */
-	int tvc_vq_desc;
+	struct vring_used_elem tvc_vq_used;
 	/* virtio-scsi initiator task attribute */
 	int tvc_task_attr;
 	/* virtio-scsi response incoming iovecs */
@@ -441,8 +441,9 @@ vhost_scsi_do_evt_work(struct vhost_scsi *vs, struct vhost_scsi_evt *evt)
 	struct vhost_virtqueue *vq = &vs->vqs[VHOST_SCSI_VQ_EVT].vq;
 	struct virtio_scsi_event *event = &evt->event;
 	struct virtio_scsi_event __user *eventp;
+	struct vring_used_elem used;
 	unsigned out, in;
-	int head, ret;
+	int ret;
 
 	if (!vq->private_data) {
 		vs->vs_events_missed = true;
@@ -451,16 +452,16 @@ vhost_scsi_do_evt_work(struct vhost_scsi *vs, struct vhost_scsi_evt *evt)
 
 again:
 	vhost_disable_notify(&vs->dev, vq);
-	head = vhost_get_vq_desc(vq, vq->iov,
+	ret = vhost_get_vq_desc(vq, &used, vq->iov,
 			ARRAY_SIZE(vq->iov), &out, &in,
 			NULL, NULL);
-	if (head < 0) {
+	if (ret == -ENOSPC) {
+		if (vhost_enable_notify(&vs->dev, vq))
+			goto again;
 		vs->vs_events_missed = true;
 		return;
 	}
-	if (head == vq->num) {
-		if (vhost_enable_notify(&vs->dev, vq))
-			goto again;
+	if (ret < 0) {
 		vs->vs_events_missed = true;
 		return;
 	}
@@ -480,7 +481,7 @@ again:
 	eventp = vq->iov[out].iov_base;
 	ret = __copy_to_user(eventp, event, sizeof(*event));
 	if (!ret)
-		vhost_add_used_and_signal(&vs->dev, vq, head, 0);
+		vhost_add_used_and_signal(&vs->dev, vq, &used, 0);
 	else
 		vq_err(vq, "Faulted on vhost_scsi_send_event\n");
 }
@@ -541,7 +542,7 @@ static void vhost_scsi_complete_cmd_work(struct vhost_work *work)
 		ret = copy_to_iter(&v_rsp, sizeof(v_rsp), &iov_iter);
 		if (likely(ret == sizeof(v_rsp))) {
 			struct vhost_scsi_virtqueue *q;
-			vhost_add_used(cmd->tvc_vq, cmd->tvc_vq_desc, 0);
+			vhost_add_used(cmd->tvc_vq, &cmd->tvc_vq_used, 0);
 			q = container_of(cmd->tvc_vq, struct vhost_scsi_virtqueue, vq);
 			vq = q - vs->vqs;
 			__set_bit(vq, signal);
@@ -784,7 +785,7 @@ static void vhost_scsi_submission_work(struct work_struct *work)
 static void
 vhost_scsi_send_bad_target(struct vhost_scsi *vs,
 			   struct vhost_virtqueue *vq,
-			   int head, unsigned out)
+			   struct vring_used_elem *used, unsigned out)
 {
 	struct virtio_scsi_cmd_resp __user *resp;
 	struct virtio_scsi_cmd_resp rsp;
@@ -795,7 +796,7 @@ vhost_scsi_send_bad_target(struct vhost_scsi *vs,
 	resp = vq->iov[out].iov_base;
 	ret = __copy_to_user(resp, &rsp, sizeof(rsp));
 	if (!ret)
-		vhost_add_used_and_signal(&vs->dev, vq, head, 0);
+		vhost_add_used_and_signal(&vs->dev, vq, used, 0);
 	else
 		pr_err("Faulted on virtio_scsi_cmd_resp\n");
 }
@@ -807,11 +808,12 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 	struct virtio_scsi_cmd_req v_req;
 	struct virtio_scsi_cmd_req_pi v_req_pi;
 	struct vhost_scsi_cmd *cmd;
+	struct vring_used_elem used;
 	struct iov_iter out_iter, in_iter, prot_iter, data_iter;
 	u64 tag;
 	u32 exp_data_len, data_direction;
 	unsigned int out = 0, in = 0;
-	int head, ret, prot_bytes;
+	int ret, prot_bytes;
 	size_t req_size, rsp_size = sizeof(struct virtio_scsi_cmd_resp);
 	size_t out_size, in_size;
 	u16 lun;
@@ -831,22 +833,22 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 	vhost_disable_notify(&vs->dev, vq);
 
 	for (;;) {
-		head = vhost_get_vq_desc(vq, vq->iov,
-					 ARRAY_SIZE(vq->iov), &out, &in,
-					 NULL, NULL);
+		ret = vhost_get_vq_desc(vq, &used, vq->iov,
+					ARRAY_SIZE(vq->iov), &out, &in,
+					NULL, NULL);
 		pr_debug("vhost_get_vq_desc: head: %d, out: %u in: %u\n",
-			 head, out, in);
-		/* On error, stop handling until the next kick. */
-		if (unlikely(head < 0))
-			break;
+			 used.id, out, in);
 		/* Nothing new?  Wait for eventfd to tell us they refilled. */
-		if (head == vq->num) {
+		if (ret == -ENOSPC) {
 			if (unlikely(vhost_enable_notify(&vs->dev, vq))) {
 				vhost_disable_notify(&vs->dev, vq);
 				continue;
 			}
 			break;
 		}
+		/* On error, stop handling until the next kick. */
+		if (unlikely(ret < 0))
+			break;
 		/*
 		 * Check for a sane response buffer so we can report early
 		 * errors back to the guest.
@@ -891,20 +893,20 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 
 		if (unlikely(!copy_from_iter_full(req, req_size, &out_iter))) {
 			vq_err(vq, "Faulted on copy_from_iter\n");
-			vhost_scsi_send_bad_target(vs, vq, head, out);
+			vhost_scsi_send_bad_target(vs, vq, &used, out);
 			continue;
 		}
 		/* virtio-scsi spec requires byte 0 of the lun to be 1 */
 		if (unlikely(*lunp != 1)) {
 			vq_err(vq, "Illegal virtio-scsi lun: %u\n", *lunp);
-			vhost_scsi_send_bad_target(vs, vq, head, out);
+			vhost_scsi_send_bad_target(vs, vq, &used, out);
 			continue;
 		}
 
 		tpg = READ_ONCE(vs_tpg[*target]);
 		if (unlikely(!tpg)) {
 			/* Target does not exist, fail the request */
-			vhost_scsi_send_bad_target(vs, vq, head, out);
+			vhost_scsi_send_bad_target(vs, vq, &used, out);
 			continue;
 		}
 		/*
@@ -950,7 +952,8 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 				if (data_direction != DMA_TO_DEVICE) {
 					vq_err(vq, "Received non zero pi_bytesout,"
 						" but wrong data_direction\n");
-					vhost_scsi_send_bad_target(vs, vq, head, out);
+					vhost_scsi_send_bad_target(vs, vq,
+								   &used, out);
 					continue;
 				}
 				prot_bytes = vhost32_to_cpu(vq, v_req_pi.pi_bytesout);
@@ -958,7 +961,8 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 				if (data_direction != DMA_FROM_DEVICE) {
 					vq_err(vq, "Received non zero pi_bytesin,"
 						" but wrong data_direction\n");
-					vhost_scsi_send_bad_target(vs, vq, head, out);
+					vhost_scsi_send_bad_target(vs, vq,
+								   &used, out);
 					continue;
 				}
 				prot_bytes = vhost32_to_cpu(vq, v_req_pi.pi_bytesin);
@@ -996,7 +1000,7 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 			vq_err(vq, "Received SCSI CDB with command_size: %d that"
 				" exceeds SCSI_MAX_VARLEN_CDB_SIZE: %d\n",
 				scsi_command_size(cdb), VHOST_SCSI_MAX_CDB_SIZE);
-			vhost_scsi_send_bad_target(vs, vq, head, out);
+			vhost_scsi_send_bad_target(vs, vq, &used, out);
 			continue;
 		}
 		cmd = vhost_scsi_get_tag(vq, tpg, cdb, tag, lun, task_attr,
@@ -1005,7 +1009,7 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 		if (IS_ERR(cmd)) {
 			vq_err(vq, "vhost_scsi_get_tag failed %ld\n",
 			       PTR_ERR(cmd));
-			vhost_scsi_send_bad_target(vs, vq, head, out);
+			vhost_scsi_send_bad_target(vs, vq, &used, out);
 			continue;
 		}
 		cmd->tvc_vhost = vs;
@@ -1025,7 +1029,7 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 			if (unlikely(ret)) {
 				vq_err(vq, "Failed to map iov to sgl\n");
 				vhost_scsi_release_cmd(&cmd->tvc_se_cmd);
-				vhost_scsi_send_bad_target(vs, vq, head, out);
+				vhost_scsi_send_bad_target(vs, vq, &used, out);
 				continue;
 			}
 		}
@@ -1034,7 +1038,7 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 		 * complete the virtio-scsi request in TCM callback context via
 		 * vhost_scsi_queue_data_in() and vhost_scsi_queue_status()
 		 */
-		cmd->tvc_vq_desc = head;
+		cmd->tvc_vq_used = used;
 		/*
 		 * Dispatch cmd descriptor for cmwq execution in process
 		 * context provided by vhost_scsi_workqueue.  This also ensures

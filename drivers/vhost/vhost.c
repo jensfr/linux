@@ -1962,6 +1962,7 @@ static int get_indirect(struct vhost_virtqueue *vq,
  * never a valid descriptor number) if none was found.  A negative code is
  * returned on error. */
 int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+		      struct vring_used_elem *used,
 		      struct iovec iov[], unsigned int iov_size,
 		      unsigned int *out_num, unsigned int *in_num,
 		      struct vhost_log *log, unsigned int *log_num)
@@ -1994,7 +1995,7 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
 		 * invalid.
 		 */
 		if (vq->avail_idx == last_avail_idx)
-			return vq->num;
+			return -ENOSPC;
 
 		/* Only get avail ring entries after they have been
 		 * exposed by guest.
@@ -2012,6 +2013,7 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
 		return -EFAULT;
 	}
 
+	used->id = ring_head;
 	head = vhost16_to_cpu(vq, ring_head);
 
 	/* If their number is silly, that's an error. */
@@ -2100,9 +2102,15 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
 	/* Assume notifications from guest are disabled at this point,
 	 * if they aren't we would need to update avail_event index. */
 	BUG_ON(!(vq->used_flags & VRING_USED_F_NO_NOTIFY));
-	return head;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(vhost_get_vq_desc);
+
+static void vhost_set_used_len(struct vhost_virtqueue *vq,
+			       struct vring_used_elem *used, int len)
+{
+	used->len = cpu_to_vhost32(vq, len);
+}
 
 /* This is a multi-buffer version of vhost_get_desc, that works if
  *	vq has read descriptors only.
@@ -2120,13 +2128,13 @@ int vhost_get_bufs(struct vhost_virtqueue *vq,
 		   unsigned *iovcount,
 		   struct vhost_log *log,
 		   unsigned *log_num,
-		   unsigned int quota)
+		   unsigned int quota,
+		   s16 *count)
 {
 	unsigned int out, in;
 	int seg = 0;
 	int headcount = 0;
-	unsigned d;
-	int r, nlogs = 0;
+	int r = 0, nlogs = 0;
 	/* len is always initialized before use since we are always called with
 	 * datalen > 0.
 	 */
@@ -2137,17 +2145,12 @@ int vhost_get_bufs(struct vhost_virtqueue *vq,
 			r = -ENOBUFS;
 			goto err;
 		}
-		r = vhost_get_vq_desc(vq, vq->iov + seg,
+		r = vhost_get_vq_desc(vq, &heads[headcount], vq->iov + seg,
 				      ARRAY_SIZE(vq->iov) - seg, &out,
 				      &in, log, log_num);
 		if (unlikely(r < 0))
 			goto err;
 
-		d = r;
-		if (d == vq->num) {
-			r = 0;
-			goto err;
-		}
 		if (unlikely(out || in <= 0)) {
 			vq_err(vq, "unexpected descriptor format for RX: "
 				"out %d, in %d\n", out, in);
@@ -2158,24 +2161,26 @@ int vhost_get_bufs(struct vhost_virtqueue *vq,
 			nlogs += *log_num;
 			log += *log_num;
 		}
-		heads[headcount].id = cpu_to_vhost32(vq, d);
+
 		len = iov_length(vq->iov + seg, in);
-		heads[headcount].len = cpu_to_vhost32(vq, len);
+		vhost_set_used_len(vq, &heads[headcount], len);
 		datalen -= len;
 		++headcount;
 		seg += in;
 	}
-	heads[headcount - 1].len = cpu_to_vhost32(vq, len + datalen);
+	vhost_set_used_len(vq, &heads[headcount - 1], len + datalen);
 	*iovcount = seg;
 	if (unlikely(log))
 		*log_num = nlogs;
 
 	/* Detect overrun */
 	if (unlikely(datalen > 0)) {
-		r = UIO_MAXIOV + 1;
+		headcount = UIO_MAXIOV + 1;
 		goto err;
 	}
-	return headcount;
+
+	*count = headcount;
+	return 0;
 err:
 	vhost_discard_vq_desc(vq, headcount);
 	return r;
@@ -2191,14 +2196,11 @@ EXPORT_SYMBOL_GPL(vhost_discard_vq_desc);
 
 /* After we've used one of their buffers, we tell them about it.  We'll then
  * want to notify the guest, using eventfd. */
-int vhost_add_used(struct vhost_virtqueue *vq, unsigned int head, int len)
+int vhost_add_used(struct vhost_virtqueue *vq, struct vring_used_elem *used,
+		   int len)
 {
-	struct vring_used_elem heads = {
-		cpu_to_vhost32(vq, head),
-		cpu_to_vhost32(vq, len)
-	};
-
-	return vhost_add_used_n(vq, &heads, 1);
+	vhost_set_used_len(vq, used, len);
+	return vhost_add_used_n(vq, used, 1);
 }
 EXPORT_SYMBOL_GPL(vhost_add_used);
 
@@ -2331,9 +2333,9 @@ EXPORT_SYMBOL_GPL(vhost_signal);
 /* And here's the combo meal deal.  Supersize me! */
 void vhost_add_used_and_signal(struct vhost_dev *dev,
 			       struct vhost_virtqueue *vq,
-			       unsigned int head, int len)
+			       struct vring_used_elem *used, int len)
 {
-	vhost_add_used(vq, head, len);
+	vhost_add_used(vq, used, len);
 	vhost_signal(dev, vq);
 }
 EXPORT_SYMBOL_GPL(vhost_add_used_and_signal);

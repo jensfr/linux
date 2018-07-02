@@ -430,15 +430,16 @@ static int vhost_net_enable_vq(struct vhost_net *n,
 
 static int vhost_net_tx_get_vq_desc(struct vhost_net *net,
 				    struct vhost_virtqueue *vq,
+				    struct vring_used_elem *used_elem,
 				    struct iovec iov[], unsigned int iov_size,
 				    unsigned int *out_num, unsigned int *in_num,
 				    bool *busyloop_intr)
 {
 	unsigned long uninitialized_var(endtime);
-	int r = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
+	int r = vhost_get_vq_desc(vq, used_elem, vq->iov, ARRAY_SIZE(vq->iov),
 				  out_num, in_num, NULL, NULL);
 
-	if (r == vq->num && vq->busyloop_timeout) {
+	if (r == -ENOSPC && vq->busyloop_timeout) {
 		preempt_disable();
 		endtime = busy_clock() + vq->busyloop_timeout;
 		while (vhost_can_busy_poll(endtime)) {
@@ -451,8 +452,9 @@ static int vhost_net_tx_get_vq_desc(struct vhost_net *net,
 			cpu_relax();
 		}
 		preempt_enable();
-		r = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
-				      out_num, in_num, NULL, NULL);
+		r = vhost_get_vq_desc(vq, used_elem, vq->iov,
+				      ARRAY_SIZE(vq->iov), out_num, in_num,
+				      NULL, NULL);
 	}
 
 	return r;
@@ -474,7 +476,6 @@ static void handle_tx(struct vhost_net *net)
 	struct vhost_net_virtqueue *nvq = &net->vqs[VHOST_NET_VQ_TX];
 	struct vhost_virtqueue *vq = &nvq->vq;
 	unsigned out, in;
-	int head;
 	struct msghdr msg = {
 		.msg_name = NULL,
 		.msg_namelen = 0,
@@ -487,6 +488,7 @@ static void handle_tx(struct vhost_net *net)
 	size_t hdr_size;
 	struct socket *sock;
 	struct vhost_net_ubuf_ref *uninitialized_var(ubufs);
+	struct vring_used_elem used;
 	bool zcopy, zcopy_used;
 	int sent_pkts = 0;
 
@@ -512,14 +514,11 @@ static void handle_tx(struct vhost_net *net)
 			vhost_zerocopy_signal_used(net, vq);
 
 		busyloop_intr = false;
-		head = vhost_net_tx_get_vq_desc(net, vq, vq->iov,
-						ARRAY_SIZE(vq->iov),
-						&out, &in, &busyloop_intr);
-		/* On error, stop handling until the next kick. */
-		if (unlikely(head < 0))
-			break;
+		err = vhost_net_tx_get_vq_desc(net, vq, &used, vq->iov,
+					       ARRAY_SIZE(vq->iov),
+					       &out, &in, &busyloop_intr);
 		/* Nothing new?  Wait for eventfd to tell us they refilled. */
-		if (head == vq->num) {
+		if (err == -ENOSPC) {
 			if (unlikely(busyloop_intr)) {
 				vhost_poll_queue(&vq->poll);
 			} else if (unlikely(vhost_enable_notify(&net->dev, vq))) {
@@ -528,6 +527,9 @@ static void handle_tx(struct vhost_net *net)
 			}
 			break;
 		}
+		/* On error, stop handling until the next kick. */
+		if (unlikely(err < 0))
+			break;
 		if (in) {
 			vq_err(vq, "Unexpected descriptor format for TX: "
 			       "out %d, int %d\n", out, in);
@@ -555,7 +557,8 @@ static void handle_tx(struct vhost_net *net)
 			struct ubuf_info *ubuf;
 			ubuf = nvq->ubuf_info + nvq->upend_idx;
 
-			vq->heads[nvq->upend_idx].id = cpu_to_vhost32(vq, head);
+			vq->heads[nvq->upend_idx].id =
+				cpu_to_vhost32(vq, used.id);
 			vq->heads[nvq->upend_idx].len = VHOST_DMA_IN_PROGRESS;
 			ubuf->callback = vhost_zerocopy_callback;
 			ubuf->ctx = nvq->ubufs;
@@ -596,7 +599,7 @@ static void handle_tx(struct vhost_net *net)
 			pr_debug("Truncated TX packet: "
 				 " len %d != %zd\n", err, len);
 		if (!zcopy_used)
-			vhost_add_used_and_signal(&net->dev, vq, head, 0);
+			vhost_add_used_and_signal(&net->dev, vq, &used, 0);
 		else
 			vhost_zerocopy_signal_used(net, vq);
 		vhost_net_tx_packet(net);
@@ -754,17 +757,15 @@ static void handle_rx(struct vhost_net *net)
 						      &busyloop_intr))) {
 		sock_len += sock_hlen;
 		vhost_len = sock_len + vhost_hlen;
-		headcount = vhost_get_bufs(vq, vq->heads + nvq->done_idx,
-					   vhost_len, &in, vq_log, &log,
-					   likely(mergeable) ? UIO_MAXIOV : 1);
-		/* On error, stop handling until the next kick. */
-		if (unlikely(headcount < 0))
-			goto out;
+		err = vhost_get_bufs(vq, vq->heads + nvq->done_idx,
+				     vhost_len, &in, vq_log, &log,
+				     likely(mergeable) ? UIO_MAXIOV : 1,
+				     &headcount);
 		/* OK, now we need to know about added descriptors. */
-		if (!headcount) {
+		if (err == -ENOSPC) {
 			if (unlikely(busyloop_intr)) {
 				vhost_poll_queue(&vq->poll);
-			} else if (unlikely(vhost_enable_notify(&net->dev, vq))) {
+			}else if (unlikely(vhost_enable_notify(&net->dev, vq))) {
 				/* They have slipped one in as we were
 				 * doing that: check again. */
 				vhost_disable_notify(&net->dev, vq);
@@ -775,6 +776,9 @@ static void handle_rx(struct vhost_net *net)
 			goto out;
 		}
 		busyloop_intr = false;
+		/* On error, stop handling until the next kick. */
+		if (unlikely(err < 0))
+			goto out;
 		if (nvq->rx_ring)
 			msg.msg_control = vhost_net_buf_consume(&nvq->rxq);
 		/* On overrun, truncate and discard */
