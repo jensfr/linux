@@ -814,7 +814,7 @@ static inline void __user *__vhost_get_user(struct vhost_virtqueue *vq,
 	return __vhost_get_user_slow(vq, addr, size, type);
 }
 
-#define vhost_put_user(vq, x, ptr)		\
+#define vhost_put_user(vq, x, ptr, type)		\
 ({ \
 	int ret = -EFAULT; \
 	if (!vq->iotlb) { \
@@ -822,7 +822,7 @@ static inline void __user *__vhost_get_user(struct vhost_virtqueue *vq,
 	} else { \
 		__typeof__(ptr) to = \
 			(__typeof__(ptr)) __vhost_get_user(vq, ptr,	\
-					  sizeof(*ptr), VHOST_ADDR_USED); \
+					  sizeof(*ptr), type); \
 		if (to != NULL) \
 			ret = __put_user(x, to); \
 		else \
@@ -1687,7 +1687,7 @@ static int vhost_update_used_flags(struct vhost_virtqueue *vq)
 {
 	void __user *used;
 	if (vhost_put_user(vq, cpu_to_vhost16(vq, vq->used_flags),
-			   &vq->used->flags) < 0)
+			   &vq->used->flags, VHOST_ADDR_USED) < 0)
 		return -EFAULT;
 	if (unlikely(vq->log_used)) {
 		/* Make sure the flag is seen before log. */
@@ -1706,7 +1706,7 @@ static int vhost_update_used_flags(struct vhost_virtqueue *vq)
 static int vhost_update_avail_event(struct vhost_virtqueue *vq, u16 avail_event)
 {
 	if (vhost_put_user(vq, cpu_to_vhost16(vq, vq->avail_idx),
-			   vhost_avail_event(vq)))
+			   vhost_avail_event(vq), VHOST_ADDR_USED))
 		return -EFAULT;
 	if (unlikely(vq->log_used)) {
 		void __user *used;
@@ -2189,12 +2189,12 @@ static int __vhost_add_used_n(struct vhost_virtqueue *vq,
 	used = vq->used->ring + start;
 	for (i = 0; i < count; i++) {
 		if (unlikely(vhost_put_user(vq, heads[i].elem.id,
-					    &used[i].id))) {
+					    &used[i].id, VHOST_ADDR_USED))) {
 			vq_err(vq, "Failed to write used id");
 			return -EFAULT;
 		}
 		if (unlikely(vhost_put_user(vq, heads[i].elem.len,
-					    &used[i].len))) {
+					    &used[i].len, VHOST_ADDR_USED))) {
 			vq_err(vq, "Failed to write used len");
 			return -EFAULT;
 		}
@@ -2240,7 +2240,7 @@ int vhost_add_used_n(struct vhost_virtqueue *vq, struct vhost_used_elem *heads,
 	/* Make sure buffer is written before we update index. */
 	smp_wmb();
 	if (vhost_put_user(vq, cpu_to_vhost16(vq, vq->last_used_idx),
-			   &vq->used->idx)) {
+			   &vq->used->idx, VHOST_ADDR_USED)) {
 		vq_err(vq, "Failed to increment used idx");
 		return -EFAULT;
 	}
