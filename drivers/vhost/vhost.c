@@ -731,41 +731,6 @@ static bool memory_access_ok(struct vhost_dev *d, struct vhost_umem *umem,
 static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
 			  struct iovec iov[], int iov_size, int access);
 
-static int vhost_copy_to_user(struct vhost_virtqueue *vq, void __user *to,
-			      const void *from, unsigned size)
-{
-	int ret;
-
-	if (!vq->iotlb)
-		return __copy_to_user(to, from, size);
-	else {
-		/* This function should be called after iotlb
-		 * prefetch, which means we're sure that all vq
-		 * could be access through iotlb. So -EAGAIN should
-		 * not happen in this case.
-		 */
-		struct iov_iter t;
-		void __user *uaddr = vhost_vq_meta_fetch(vq,
-				     (u64)(uintptr_t)to, size,
-				     VHOST_ADDR_USED);
-
-		if (uaddr)
-			return __copy_to_user(uaddr, from, size);
-
-		ret = translate_desc(vq, (u64)(uintptr_t)to, size, vq->iotlb_iov,
-				     ARRAY_SIZE(vq->iotlb_iov),
-				     VHOST_ACCESS_WO);
-		if (ret < 0)
-			goto out;
-		iov_iter_init(&t, WRITE, vq->iotlb_iov, ret, size);
-		ret = copy_to_iter(from, size, &t);
-		if (ret == size)
-			ret = 0;
-	}
-out:
-	return ret;
-}
-
 static int vhost_copy_from_user(struct vhost_virtqueue *vq, void *to,
 				void __user *from, unsigned size)
 {
@@ -1962,7 +1927,7 @@ static int get_indirect(struct vhost_virtqueue *vq,
  * never a valid descriptor number) if none was found.  A negative code is
  * returned on error. */
 int vhost_get_vq_desc(struct vhost_virtqueue *vq,
-		      struct vring_used_elem *used,
+		      struct vhost_used_elem *used,
 		      struct iovec iov[], unsigned int iov_size,
 		      unsigned int *out_num, unsigned int *in_num,
 		      struct vhost_log *log, unsigned int *log_num)
@@ -2013,7 +1978,7 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
 		return -EFAULT;
 	}
 
-	used->id = ring_head;
+	used->elem.id = ring_head;
 	head = vhost16_to_cpu(vq, ring_head);
 
 	/* If their number is silly, that's an error. */
@@ -2107,9 +2072,9 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
 EXPORT_SYMBOL_GPL(vhost_get_vq_desc);
 
 static void vhost_set_used_len(struct vhost_virtqueue *vq,
-			       struct vring_used_elem *used, int len)
+			       struct vhost_used_elem *used, int len)
 {
-	used->len = cpu_to_vhost32(vq, len);
+	used->elem.len = cpu_to_vhost32(vq, len);
 }
 
 /* This is a multi-buffer version of vhost_get_desc, that works if
@@ -2123,7 +2088,7 @@ static void vhost_set_used_len(struct vhost_virtqueue *vq,
  *	returns number of buffer heads allocated, negative on error
  */
 int vhost_get_bufs(struct vhost_virtqueue *vq,
-		   struct vring_used_elem *heads,
+		   struct vhost_used_elem *heads,
 		   int datalen,
 		   unsigned *iovcount,
 		   struct vhost_log *log,
@@ -2196,7 +2161,7 @@ EXPORT_SYMBOL_GPL(vhost_discard_vq_desc);
 
 /* After we've used one of their buffers, we tell them about it.  We'll then
  * want to notify the guest, using eventfd. */
-int vhost_add_used(struct vhost_virtqueue *vq, struct vring_used_elem *used,
+int vhost_add_used(struct vhost_virtqueue *vq, struct vhost_used_elem *used,
 		   int len)
 {
 	vhost_set_used_len(vq, used, len);
@@ -2205,27 +2170,26 @@ int vhost_add_used(struct vhost_virtqueue *vq, struct vring_used_elem *used,
 EXPORT_SYMBOL_GPL(vhost_add_used);
 
 static int __vhost_add_used_n(struct vhost_virtqueue *vq,
-			    struct vring_used_elem *heads,
+			    struct vhost_used_elem *heads,
 			    unsigned count)
 {
 	struct vring_used_elem __user *used;
 	u16 old, new;
-	int start;
+	int start, i;
 
 	start = vq->last_used_idx & (vq->num - 1);
 	used = vq->used->ring + start;
-	if (count == 1) {
-		if (vhost_put_user(vq, heads[0].id, &used->id)) {
+	for (i = 0; i < count; i++) {
+		if (unlikely(vhost_put_user(vq, heads[i].elem.id,
+					    &used[i].id))) {
 			vq_err(vq, "Failed to write used id");
 			return -EFAULT;
 		}
-		if (vhost_put_user(vq, heads[0].len, &used->len)) {
+		if (unlikely(vhost_put_user(vq, heads[i].elem.len,
+					    &used[i].len))) {
 			vq_err(vq, "Failed to write used len");
 			return -EFAULT;
 		}
-	} else if (vhost_copy_to_user(vq, used, heads, count * sizeof *used)) {
-		vq_err(vq, "Failed to write used");
-		return -EFAULT;
 	}
 	if (unlikely(vq->log_used)) {
 		/* Make sure data is seen before log. */
@@ -2249,7 +2213,7 @@ static int __vhost_add_used_n(struct vhost_virtqueue *vq,
 
 /* After we've used one of their buffers, we tell them about it.  We'll then
  * want to notify the guest, using eventfd. */
-int vhost_add_used_n(struct vhost_virtqueue *vq, struct vring_used_elem *heads,
+int vhost_add_used_n(struct vhost_virtqueue *vq, struct vhost_used_elem *heads,
 		     unsigned count)
 {
 	int start, n, r;
@@ -2333,7 +2297,7 @@ EXPORT_SYMBOL_GPL(vhost_signal);
 /* And here's the combo meal deal.  Supersize me! */
 void vhost_add_used_and_signal(struct vhost_dev *dev,
 			       struct vhost_virtqueue *vq,
-			       struct vring_used_elem *used, int len)
+			       struct vhost_used_elem *used, int len)
 {
 	vhost_add_used(vq, used, len);
 	vhost_signal(dev, vq);
@@ -2343,7 +2307,7 @@ EXPORT_SYMBOL_GPL(vhost_add_used_and_signal);
 /* multi-buffer version of vhost_add_used_and_signal */
 void vhost_add_used_and_signal_n(struct vhost_dev *dev,
 				 struct vhost_virtqueue *vq,
-				 struct vring_used_elem *heads, unsigned count)
+				 struct vhost_used_elem *heads, unsigned count)
 {
 	vhost_add_used_n(vq, heads, count);
 	vhost_signal(dev, vq);

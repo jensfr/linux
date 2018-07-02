@@ -34,6 +34,10 @@ struct vhost_poll {
 	struct vhost_dev	 *dev;
 };
 
+struct vhost_used_elem {
+	struct vring_used_elem elem;
+};
+
 void vhost_work_init(struct vhost_work *work, vhost_work_fn_t fn);
 void vhost_work_queue(struct vhost_dev *dev, struct vhost_work *work);
 bool vhost_has_work(struct vhost_dev *dev);
@@ -126,7 +130,7 @@ struct vhost_virtqueue {
 	struct iovec iov[UIO_MAXIOV];
 	struct iovec iotlb_iov[64];
 	struct iovec *indirect;
-	struct vring_used_elem *heads;
+	struct vhost_used_elem *heads;
 	/* Protected by virtqueue mutex. */
 	struct vhost_umem *umem;
 	struct vhost_umem *iotlb;
@@ -182,12 +186,12 @@ bool vhost_vq_access_ok(struct vhost_virtqueue *vq);
 bool vhost_log_access_ok(struct vhost_dev *);
 
 int vhost_get_vq_desc(struct vhost_virtqueue *,
-		      struct vring_used_elem *used_elem,
+		      struct vhost_used_elem *used_elem,
 		      struct iovec iov[], unsigned int iov_count,
 		      unsigned int *out_num, unsigned int *in_num,
 		      struct vhost_log *log, unsigned int *log_num);
 int vhost_get_bufs(struct vhost_virtqueue *vq,
-		   struct vring_used_elem *heads,
+		   struct vhost_used_elem *heads,
 		   int datalen,
 		   unsigned *iovcount,
 		   struct vhost_log *log,
@@ -198,13 +202,13 @@ void vhost_discard_vq_desc(struct vhost_virtqueue *, int n);
 
 int vhost_vq_init_access(struct vhost_virtqueue *);
 int vhost_add_used(struct vhost_virtqueue *vq,
-		   struct vring_used_elem *elem, int len);
-int vhost_add_used_n(struct vhost_virtqueue *, struct vring_used_elem *heads,
+		   struct vhost_used_elem *elem, int len);
+int vhost_add_used_n(struct vhost_virtqueue *vq, struct vhost_used_elem *heads,
 		     unsigned count);
 void vhost_add_used_and_signal(struct vhost_dev *, struct vhost_virtqueue *,
-			       struct vring_used_elem *, int len);
+			       struct vhost_used_elem *, int len);
 void vhost_add_used_and_signal_n(struct vhost_dev *, struct vhost_virtqueue *,
-			       struct vring_used_elem *heads, unsigned count);
+			       struct vhost_used_elem *heads, unsigned count);
 void vhost_signal(struct vhost_dev *, struct vhost_virtqueue *);
 void vhost_disable_notify(struct vhost_dev *, struct vhost_virtqueue *);
 bool vhost_vq_avail_empty(struct vhost_dev *, struct vhost_virtqueue *);

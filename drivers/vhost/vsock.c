@@ -98,7 +98,7 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 
 	for (;;) {
 		struct virtio_vsock_pkt *pkt;
-		struct vring_used_elem used;
+		struct vhost_used_elem used;
 		struct iov_iter iov_iter;
 		unsigned out, in;
 		size_t nbytes;
@@ -146,7 +146,7 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 			break;
 		}
 
-		len = vhost32_to_cpu(vq, used.len);
+		len = vhost32_to_cpu(vq, used.elem.len);
 		iov_iter_init(&iov_iter, READ, &vq->iov[out], in, len);
 
 		nbytes = copy_to_iter(&pkt->hdr, sizeof(pkt->hdr), &iov_iter);
@@ -346,7 +346,7 @@ static void vhost_vsock_handle_tx_kick(struct vhost_work *work)
 	struct vhost_vsock *vsock = container_of(vq->dev, struct vhost_vsock,
 						 dev);
 	struct virtio_vsock_pkt *pkt;
-	struct vring_used_elem used;
+	struct vhost_used_elem used;
 	int ret;
 	unsigned int out, in;
 	bool added = false;

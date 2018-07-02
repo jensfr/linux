@@ -67,7 +67,7 @@ struct vhost_scsi_inflight {
 
 struct vhost_scsi_cmd {
 	/* Descriptor from vhost_get_vq_desc() for virt_queue segment */
-	struct vring_used_elem tvc_vq_used;
+	struct vhost_used_elem tvc_vq_used;
 	/* virtio-scsi initiator task attribute */
 	int tvc_task_attr;
 	/* virtio-scsi response incoming iovecs */
@@ -441,7 +441,7 @@ vhost_scsi_do_evt_work(struct vhost_scsi *vs, struct vhost_scsi_evt *evt)
 	struct vhost_virtqueue *vq = &vs->vqs[VHOST_SCSI_VQ_EVT].vq;
 	struct virtio_scsi_event *event = &evt->event;
 	struct virtio_scsi_event __user *eventp;
-	struct vring_used_elem used;
+	struct vhost_used_elem used;
 	unsigned out, in;
 	int ret;
 
@@ -785,7 +785,7 @@ static void vhost_scsi_submission_work(struct work_struct *work)
 static void
 vhost_scsi_send_bad_target(struct vhost_scsi *vs,
 			   struct vhost_virtqueue *vq,
-			   struct vring_used_elem *used, unsigned out)
+			   struct vhost_used_elem *used, unsigned out)
 {
 	struct virtio_scsi_cmd_resp __user *resp;
 	struct virtio_scsi_cmd_resp rsp;
@@ -808,7 +808,7 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 	struct virtio_scsi_cmd_req v_req;
 	struct virtio_scsi_cmd_req_pi v_req_pi;
 	struct vhost_scsi_cmd *cmd;
-	struct vring_used_elem used;
+	struct vhost_used_elem used;
 	struct iov_iter out_iter, in_iter, prot_iter, data_iter;
 	u64 tag;
 	u32 exp_data_len, data_direction;
@@ -837,7 +837,7 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 					ARRAY_SIZE(vq->iov), &out, &in,
 					NULL, NULL);
 		pr_debug("vhost_get_vq_desc: head: %d, out: %u in: %u\n",
-			 used.id, out, in);
+			 used.elem.id, out, in);
 		/* Nothing new?  Wait for eventfd to tell us they refilled. */
 		if (ret == -ENOSPC) {
 			if (unlikely(vhost_enable_notify(&vs->dev, vq))) {
