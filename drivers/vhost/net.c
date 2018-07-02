@@ -702,83 +702,6 @@ static int vhost_net_rx_peek_head_len(struct vhost_net *net, struct sock *sk,
 	return len;
 }
 
-/* This is a multi-buffer version of vhost_get_desc, that works if
- *	vq has read descriptors only.
- * @vq		- the relevant virtqueue
- * @datalen	- data length we'll be reading
- * @iovcount	- returned count of io vectors we fill
- * @log		- vhost log
- * @log_num	- log offset
- * @quota       - headcount quota, 1 for big buffer
- *	returns number of buffer heads allocated, negative on error
- */
-static int get_rx_bufs(struct vhost_virtqueue *vq,
-		       struct vring_used_elem *heads,
-		       int datalen,
-		       unsigned *iovcount,
-		       struct vhost_log *log,
-		       unsigned *log_num,
-		       unsigned int quota)
-{
-	unsigned int out, in;
-	int seg = 0;
-	int headcount = 0;
-	unsigned d;
-	int r, nlogs = 0;
-	/* len is always initialized before use since we are always called with
-	 * datalen > 0.
-	 */
-	u32 uninitialized_var(len);
-
-	while (datalen > 0 && headcount < quota) {
-		if (unlikely(seg >= UIO_MAXIOV)) {
-			r = -ENOBUFS;
-			goto err;
-		}
-		r = vhost_get_vq_desc(vq, vq->iov + seg,
-				      ARRAY_SIZE(vq->iov) - seg, &out,
-				      &in, log, log_num);
-		if (unlikely(r < 0))
-			goto err;
-
-		d = r;
-		if (d == vq->num) {
-			r = 0;
-			goto err;
-		}
-		if (unlikely(out || in <= 0)) {
-			vq_err(vq, "unexpected descriptor format for RX: "
-				"out %d, in %d\n", out, in);
-			r = -EINVAL;
-			goto err;
-		}
-		if (unlikely(log)) {
-			nlogs += *log_num;
-			log += *log_num;
-		}
-		heads[headcount].id = cpu_to_vhost32(vq, d);
-		len = iov_length(vq->iov + seg, in);
-		heads[headcount].len = cpu_to_vhost32(vq, len);
-		datalen -= len;
-		++headcount;
-		seg += in;
-	}
-	heads[headcount - 1].len = cpu_to_vhost32(vq, len + datalen);
-	*iovcount = seg;
-	if (unlikely(log))
-		*log_num = nlogs;
-
-	/* Detect overrun */
-	if (unlikely(datalen > 0)) {
-		r = UIO_MAXIOV + 1;
-		goto err;
-	}
-	return headcount;
-err:
-	vhost_discard_vq_desc(vq, headcount);
-	return r;
-}
-
 /* Expects to be always run from workqueue - which acts as
  * read-size critical section for our kind of RCU. */
 static void handle_rx(struct vhost_net *net)
@@ -831,9 +754,9 @@ static void handle_rx(struct vhost_net *net)
 						      &busyloop_intr))) {
 		sock_len += sock_hlen;
 		vhost_len = sock_len + vhost_hlen;
-		headcount = get_rx_bufs(vq, vq->heads + nvq->done_idx,
-					vhost_len, &in, vq_log, &log,
-					likely(mergeable) ? UIO_MAXIOV : 1);
+		headcount = vhost_get_bufs(vq, vq->heads + nvq->done_idx,
+					   vhost_len, &in, vq_log, &log,
+					   likely(mergeable) ? UIO_MAXIOV : 1);
 		/* On error, stop handling until the next kick. */
 		if (unlikely(headcount < 0))
 			goto out;

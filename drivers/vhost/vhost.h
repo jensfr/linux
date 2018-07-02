@@ -185,6 +185,13 @@ int vhost_get_vq_desc(struct vhost_virtqueue *,
 		      struct iovec iov[], unsigned int iov_count,
 		      unsigned int *out_num, unsigned int *in_num,
 		      struct vhost_log *log, unsigned int *log_num);
+int vhost_get_bufs(struct vhost_virtqueue *vq,
+		   struct vring_used_elem *heads,
+		   int datalen,
+		   unsigned *iovcount,
+		   struct vhost_log *log,
+		   unsigned *log_num,
+		   unsigned int quota);
 void vhost_discard_vq_desc(struct vhost_virtqueue *, int n);
 
 int vhost_vq_init_access(struct vhost_virtqueue *);
