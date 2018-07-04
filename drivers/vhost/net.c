@@ -591,7 +591,7 @@ static void handle_tx(struct vhost_net *net)
 				nvq->upend_idx = ((unsigned)nvq->upend_idx - 1)
 					% UIO_MAXIOV;
 			}
-			vhost_discard_vq_desc(vq, 1);
+			vhost_discard_vq_desc(vq, &used, 1);
 			vhost_net_enable_vq(net, vq);
 			break;
 		}
@@ -755,10 +755,12 @@ static void handle_rx(struct vhost_net *net)
 
 	while ((sock_len = vhost_net_rx_peek_head_len(net, sock->sk,
 						      &busyloop_intr))) {
+		struct vhost_used_elem *used = vq->heads + nvq->done_idx;
+
 		sock_len += sock_hlen;
 		vhost_len = sock_len + vhost_hlen;
-		err = vhost_get_bufs(vq, vq->heads + nvq->done_idx,
-				     vhost_len, &in, vq_log, &log,
+		err = vhost_get_bufs(vq, used, vhost_len,
+				     &in, vq_log, &log,
 				     likely(mergeable) ? UIO_MAXIOV : 1,
 				     &headcount);
 		/* OK, now we need to know about added descriptors. */
@@ -806,7 +808,7 @@ static void handle_rx(struct vhost_net *net)
 		if (unlikely(err != sock_len)) {
 			pr_debug("Discarded rx packet: "
 				 " len %d, expected %zd\n", err, sock_len);
-			vhost_discard_vq_desc(vq, headcount);
+			vhost_discard_vq_desc(vq, used, 1);
 			continue;
 		}
 		/* Supply virtio_net_hdr if VHOST_NET_F_VIRTIO_NET_HDR */
@@ -830,7 +832,7 @@ static void handle_rx(struct vhost_net *net)
 		    copy_to_iter(&num_buffers, sizeof num_buffers,
 				 &fixup) != sizeof num_buffers) {
 			vq_err(vq, "Failed num_buffers write");
-			vhost_discard_vq_desc(vq, headcount);
+			vhost_discard_vq_desc(vq, used, 1);
 			goto out;
 		}
 		nvq->done_idx += headcount;
