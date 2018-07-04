@@ -96,8 +96,14 @@ struct vhost_virtqueue {
 		struct vring_desc __user *desc;
 		struct vring_packed_desc __user *desc_packed;
 	};
-	struct vring_avail __user *avail;
-	struct vring_used __user *used;
+	union {
+		struct vring_avail __user *avail;
+		struct vring_packed_desc_event __user *driver_event;
+	};
+	union {
+		struct vring_used __user *used;
+		struct vring_packed_desc_event __user *device_event;
+	};
 	const struct vhost_umem_node *meta_iotlb[VHOST_NUM_ADDRS];
 	struct file *kick;
 	struct eventfd_ctx *call_ctx;

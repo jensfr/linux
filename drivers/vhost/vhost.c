@@ -1115,10 +1115,15 @@ static int vq_access_ok_packed(struct vhost_virtqueue *vq, unsigned int num,
 			       struct vring_used __user *used)
 {
 	struct vring_packed_desc *packed = (struct vring_packed_desc *)desc;
+	struct vring_packed_desc_event *driver_event =
+		(struct vring_packed_desc_event *)avail;
+	struct vring_packed_desc_event *device_event =
+		(struct vring_packed_desc_event *)used;
 
-	/* TODO: check device area and driver area */
 	return access_ok(VERIFY_READ, packed, num * sizeof(*packed)) &&
-	       access_ok(VERIFY_WRITE, packed, num * sizeof(*packed));
+	       access_ok(VERIFY_WRITE, packed, num * sizeof(*packed)) &&
+	       access_ok(VERIFY_READ, driver_event, sizeof(*driver_event)) &&
+	       access_ok(VERIFY_WRITE, device_event, sizeof(*device_event));
 }
 
 static int vq_access_ok_split(struct vhost_virtqueue *vq, unsigned int num,
@@ -1193,13 +1198,26 @@ static bool iotlb_access_ok(struct vhost_virtqueue *vq,
 	return true;
 }
 
-int vq_iotlb_prefetch(struct vhost_virtqueue *vq)
+int vq_iotlb_prefetch_packed(struct vhost_virtqueue *vq)
+{
+	int num = vq->num;
+
+	return iotlb_access_ok(vq, VHOST_ACCESS_RO, (u64)(uintptr_t)vq->desc,
+			       num * sizeof(*vq->desc), VHOST_ADDR_DESC) &&
+	       iotlb_access_ok(vq, VHOST_ACCESS_WO, (u64)(uintptr_t)vq->desc,
+			       num * sizeof(*vq->desc), VHOST_ADDR_DESC) &&
+	       iotlb_access_ok(vq, VHOST_ACCESS_RO,
+			       (u64)(uintptr_t)vq->driver_event,
+			       sizeof(*vq->driver_event), VHOST_ADDR_AVAIL) &&
+	       iotlb_access_ok(vq, VHOST_ACCESS_WO,
+			       (u64)(uintptr_t)vq->device_event,
+			       sizeof(*vq->device_event), VHOST_ADDR_USED);
+}
+
+int vq_iotlb_prefetch_split(struct vhost_virtqueue *vq)
 {
 	size_t s = vhost_has_feature(vq, VIRTIO_RING_F_EVENT_IDX) ? 2 : 0;
 	unsigned int num = vq->num;
-
-	if (!vq->iotlb)
-		return 1;
 
 	return iotlb_access_ok(vq, VHOST_ACCESS_RO, (u64)(uintptr_t)vq->desc,
 			       num * sizeof(*vq->desc), VHOST_ADDR_DESC) &&
@@ -1211,6 +1229,17 @@ int vq_iotlb_prefetch(struct vhost_virtqueue *vq)
 			       sizeof *vq->used +
 			       num * sizeof(*vq->used->ring) + s,
 			       VHOST_ADDR_USED);
+}
+
+int vq_iotlb_prefetch(struct vhost_virtqueue *vq)
+{
+	if (!vq->iotlb)
+		return 1;
+
+	if (vhost_has_feature(vq, VIRTIO_F_RING_PACKED))
+		return vq_iotlb_prefetch_packed(vq);
+	else
+		return vq_iotlb_prefetch_split(vq);
 }
 EXPORT_SYMBOL_GPL(vq_iotlb_prefetch);
 
@@ -1765,6 +1794,50 @@ static int vhost_update_used_flags(struct vhost_virtqueue *vq)
 		log_write(vq->log_base, vq->log_addr +
 			  (used - (void __user *)vq->used),
 			  sizeof vq->used->flags);
+		if (vq->log_ctx)
+			eventfd_signal(vq->log_ctx, 1);
+	}
+	return 0;
+}
+
+static int vhost_update_device_flags(struct vhost_virtqueue *vq,
+				     __virtio16 device_flags)
+{
+	void __user *flags;
+
+	if (vhost_put_user(vq, device_flags, &vq->device_event->flags,
+			   VHOST_ADDR_USED) < 0)
+		return -EFAULT;
+	if (unlikely(vq->log_used)) {
+		/* Make sure the flag is seen before log. */
+		smp_wmb();
+		/* Log used flag write. */
+		flags = &vq->device_event->flags;
+		log_write(vq->log_base, vq->log_addr +
+			  (flags - (void __user *)vq->device_event),
+			  sizeof(vq->device_event->flags));
+		if (vq->log_ctx)
+			eventfd_signal(vq->log_ctx, 1);
+	}
+	return 0;
+}
+
+static int vhost_update_device_off_wrap(struct vhost_virtqueue *vq,
+					__virtio16 device_off_wrap)
+{
+	void __user *off_wrap;
+
+	if (vhost_put_user(vq, device_off_wrap, &vq->device_event->off_wrap,
+			   VHOST_ADDR_USED) < 0)
+		return -EFAULT;
+	if (unlikely(vq->log_used)) {
+		/* Make sure the flag is seen before log. */
+		smp_wmb();
+		/* Log used flag write. */
+		off_wrap = &vq->device_event->off_wrap;
+		log_write(vq->log_base, vq->log_addr +
+			  (off_wrap - (void __user *)vq->device_event),
+			  sizeof(vq->device_event->off_wrap));
 		if (vq->log_ctx)
 			eventfd_signal(vq->log_ctx, 1);
 	}
@@ -2754,15 +2827,12 @@ int vhost_add_used_n(struct vhost_virtqueue *vq,
 }
 EXPORT_SYMBOL_GPL(vhost_add_used_n);
 
-static bool vhost_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+static bool vhost_notify_split(struct vhost_dev *dev,
+			       struct vhost_virtqueue *vq)
 {
 	__u16 old, new;
 	__virtio16 event;
 	bool v;
-
-	/* TODO: check driver area */
-	if (vhost_has_feature(vq, VIRTIO_F_RING_PACKED))
-		return true;
 
 	/* Flush out used index updates. This is paired
 	 * with the barrier that the Guest executes when enabling
@@ -2794,6 +2864,64 @@ static bool vhost_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
 		return true;
 	}
 	return vring_need_event(vhost16_to_cpu(vq, event), new, old);
+}
+
+static bool vhost_notify_packed(struct vhost_dev *dev,
+				struct vhost_virtqueue *vq)
+{
+	__virtio16 event_off_wrap, event_flags;
+	__u16 old, new, off_wrap;
+	bool v;
+
+	/* Flush out used descriptors updates. This is paired
+	 * with the barrier that the Guest executes when enabling
+	 * interrupts.
+	 */
+	smp_mb();
+
+	if (vhost_get_avail(vq, event_flags,
+			   &vq->driver_event->flags) < 0) {
+		vq_err(vq, "Failed to get driver desc_event_flags");
+		return true;
+	}
+
+	if (!vhost_has_feature(vq, VIRTIO_RING_F_EVENT_IDX))
+		return event_flags !=
+		       cpu_to_vhost16(vq, VRING_EVENT_F_DISABLE);
+
+	old = vq->signalled_used;
+	v = vq->signalled_used_valid;
+	new = vq->signalled_used = vq->last_used_idx;
+	vq->signalled_used_valid = true;
+
+	if (event_flags != cpu_to_vhost16(vq, VRING_EVENT_F_DESC))
+		return event_flags !=
+		       cpu_to_vhost16(vq, VRING_EVENT_F_DISABLE);
+
+	/* Read desc event flags before event_off and event_wrap */
+	smp_rmb();
+
+	if (vhost_get_avail(vq, event_off_wrap,
+			    &vq->driver_event->off_wrap) < 0) {
+		vq_err(vq, "Failed to get driver desc_event_off/wrap");
+		return true;
+	}
+
+	off_wrap = vhost16_to_cpu(vq, event_off_wrap);
+
+	if (unlikely(!v))
+		return true;
+
+	return vhost_vring_packed_need_event(vq, vq->last_used_wrap_counter,
+					     off_wrap, new, old);
+}
+
+static bool vhost_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+{
+	if (vhost_has_feature(vq, VIRTIO_F_RING_PACKED))
+		return vhost_notify_packed(dev, vq);
+	else
+		return vhost_notify_split(dev, vq);
 }
 
 /* This actually signals the guest, using eventfd. */
@@ -2873,10 +3001,34 @@ static bool vhost_enable_notify_packed(struct vhost_dev *dev,
 				       struct vhost_virtqueue *vq)
 {
 	struct vring_packed_desc *d = vq->desc_packed + vq->avail_idx;
-	__virtio16 flags;
+	__virtio16 flags = cpu_to_vhost16(vq, VRING_EVENT_F_ENABLE);
 	int ret;
 
-	/* TODO: enable notification through device area */
+	if (!(vq->used_flags & VRING_USED_F_NO_NOTIFY))
+		return false;
+	vq->used_flags &= ~VRING_USED_F_NO_NOTIFY;
+
+	if (vhost_has_feature(vq, VIRTIO_RING_F_EVENT_IDX)) {
+		__virtio16 off_wrap = cpu_to_vhost16(vq, vq->avail_idx |
+				      vq->avail_wrap_counter << 15);
+
+		ret = vhost_update_device_off_wrap(vq, off_wrap);
+		if (ret) {
+			vq_err(vq, "Failed to write to off warp at %p: %d\n",
+			       &vq->device_event->off_wrap, ret);
+			return false;
+		}
+		/* Make sure off_wrap is wrote before flags */
+		smp_wmb();
+		flags = cpu_to_vhost16(vq, VRING_EVENT_F_DESC);
+	}
+
+	ret = vhost_update_device_flags(vq, flags);
+	if (ret) {
+		vq_err(vq, "Failed to enable notification at %p: %d\n",
+			&vq->device_event->flags, ret);
+		return false;
+	}
 
 	/* They could have slipped one in as we were doing that: make
 	 * sure it's written, then check again.
@@ -2943,7 +3095,18 @@ EXPORT_SYMBOL_GPL(vhost_enable_notify);
 static void vhost_disable_notify_packed(struct vhost_dev *dev,
 					struct vhost_virtqueue *vq)
 {
-	/* TODO: disable notification through device area */
+	__virtio16 flags;
+	int r;
+
+	if (vq->used_flags & VRING_USED_F_NO_NOTIFY)
+		return;
+	vq->used_flags |= VRING_USED_F_NO_NOTIFY;
+
+	flags = cpu_to_vhost16(vq, VRING_EVENT_F_DISABLE);
+	r = vhost_update_device_flags(vq, flags);
+	if (r)
+		vq_err(vq, "Failed to enable notification at %p: %d\n",
+		       &vq->device_event->flags, r);
 }
 
 static void vhost_disable_notify_split(struct vhost_dev *dev,
