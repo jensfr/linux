@@ -60,6 +60,11 @@ static inline void virtio_store_mb(bool weak_barriers,
 struct virtio_device;
 struct virtqueue;
 
+union vring_union {
+	struct vring vring_split;
+	struct vring_packed vring_packed;
+};
+
 /*
  * Creates a virtqueue and allocates the descriptor ring.  If
  * may_reduce_num is set, then this may allocate a smaller ring than
@@ -79,7 +84,8 @@ struct virtqueue *vring_create_virtqueue(unsigned int index,
 
 /* Creates a virtqueue with a custom layout. */
 struct virtqueue *__vring_new_virtqueue(unsigned int index,
-					struct vring vring,
+					union vring_union vring,
+					bool packed,
 					struct virtio_device *vdev,
 					bool weak_barriers,
 					bool ctx,
